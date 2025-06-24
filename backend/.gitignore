@@ -1,0 +1,11 @@
+.idea/
+
+build/
+
+image/
+
+kernel-benchmark/
+
+toolchain/gcc/
+
+work/
