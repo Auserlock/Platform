@@ -1,6 +1,7 @@
 package main
 
 import (
+	"backend/pkg/config"
 	"backend/pkg/parse"
 	"backend/pkg/workflow"
 	"fmt"
@@ -22,6 +23,11 @@ func init() {
 	})
 
 	log.SetLevel(log.DebugLevel)
+
+	err := config.Load("config.json")
+	if err != nil {
+		log.Panicln(err)
+	}
 }
 
 func work(f string) int {

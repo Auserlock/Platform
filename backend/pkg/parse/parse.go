@@ -46,7 +46,7 @@ type CrashReport struct {
 	PatchModified     []string    `json:"patch_modified_files"`
 }
 
-// kernelPath Construct directory with CrashReport
+// construct directory with CrashReport
 func kernelPath(report *CrashReport) string {
 	return fmt.Sprintf("build/%s/linux-%s", report.Crashes[0].KernelSourceCommit, report.Crashes[0].KernelSourceCommit)
 }
