@@ -5,15 +5,16 @@ package compress
 import (
 	"backend/pkg/parse"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	log "github.com/sirupsen/logrus"
 )
 
-// kernelPath Construct directory with CrashReport
 func kernelPath(report *parse.CrashReport) string {
-	return fmt.Sprintf("build/%s/linux-%s", report.Crashes[0].KernelSourceCommit, report.Crashes[0].KernelSourceCommit)
+	rootPath, _ := os.Getwd()
+	return filepath.Join(rootPath, fmt.Sprintf("build/%s/linux-%s", report.Crashes[0].KernelSourceCommit, report.Crashes[0].KernelSourceCommit))
 }
 
 func fileExists(path string) bool {

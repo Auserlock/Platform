@@ -2,6 +2,7 @@ package compile
 
 import (
 	"archive/tar"
+	"backend/pkg/config"
 	"backend/pkg/parse"
 	"bufio"
 	"bytes"
@@ -24,6 +25,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var flag = false
+
 type ToolChain struct {
 	Name    string
 	Type    string
@@ -33,10 +36,28 @@ type ToolChain struct {
 	LIB     string
 }
 
-// KernelURL kernel download URL prefix
+var defaultGCC = ToolChain{
+	"gcc",
+	"gcc",
+	"",
+	"/usr/bin",
+	"/usr/bin/gcc",
+	"/usr/lib",
+}
+
+var defaultClang = ToolChain{
+	"clang",
+	"clang",
+	"",
+	"/usr/bin",
+	"/usr/bin/clang",
+	"/usr/lib",
+}
+
+// kernel download URL prefix
 const KernelURL = "https://github.com/torvalds/linux/archive/"
 
-// GlobalToolChain global toolchain for certain bug construct. Use InitToolChain to decide toolchain automatically
+// global toolchain for certain bug construct. Use InitToolChain to decide toolchain automatically
 var GlobalToolChain *ToolChain = nil
 
 // if deploy locally, please change below to adapt your environment
@@ -69,7 +90,20 @@ var requiredConfigs = map[string]string{
 	"CONFIG_DEBUG_KMEMLEAK":           "y",
 	"CONFIG_MAGIC_SYSRQ":              "y",
 	"CONFIG_DEBUG_KMEMLEAK_AUTO_SCAN": "y",
+	"CONFIG_PANIC_ON_OOPS":            "y",
+	"CONFIG_BUG":                      "y",
+	"CONFIG_DEBUG_BUGVERBOSE":         "y",
+	"CONFIG_KALLSYMS":                 "y",
+	"CONFIG_KALLSYMS_ALL":             "y",
 	"CONFIG_GDB_SCRIPTS":              "y",
+}
+
+func ModifyConfig(config, status string) {
+	if status != "y" && status != "n" {
+		log.Errorln("invalid status for config:", config, "status must be 'y' or 'n', skipping modification")
+		return
+	}
+	requiredConfigs[config] = status
 }
 
 // config environs for kernel build; use Toolchain build manually
@@ -82,12 +116,13 @@ func buildEnv() []string {
 	return env
 }
 
-// kernelPath Construct directory with CrashReport
+// construct directory with CrashReport
 func kernelPath(report *parse.CrashReport) string {
-	return fmt.Sprintf("build/%s/linux-%s", report.Crashes[0].KernelSourceCommit, report.Crashes[0].KernelSourceCommit)
+	rootPath, _ := os.Getwd()
+	return filepath.Join(rootPath, fmt.Sprintf("build/%s/linux-%s", report.Crashes[0].KernelSourceCommit, report.Crashes[0].KernelSourceCommit))
 }
 
-// fileExists check if one file exist
+// check if one file exist
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil || !os.IsNotExist(err)
@@ -114,7 +149,7 @@ func dirExistsAndNotEmpty(path string) (bool, error) {
 	return len(entries) > 0, nil
 }
 
-// DownloadKernel download kernel archive
+// download kernel archive
 func DownloadKernel(report *parse.CrashReport) error {
 	if GlobalToolChain == nil {
 		return fmt.Errorf("toolchain not initialized")
@@ -135,13 +170,23 @@ func DownloadKernel(report *parse.CrashReport) error {
 	saveDir := "build/" + commit
 	err := os.MkdirAll(saveDir, 0755)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create directory %s: %v", saveDir, err)
 	}
 
 	tarFilePath := filepath.Join(saveDir, fileName)
 	sourceDir := filepath.Join(saveDir, "linux-"+commit)
 
-	log.Infoln("download dir:", downloadURL)
+	exists, err := dirExistsAndNotEmpty(sourceDir)
+	if err != nil {
+		return err
+	}
+	if exists {
+		log.Infoln("target dir already exists, skip download and decompress.", fileName)
+		log.Infof("if need redownload, please remove dir: %s yourself\n", sourceDir)
+		return nil
+	}
+
+	log.Infoln("download url:", downloadURL)
 	log.Infoln("save as:", tarFilePath)
 	log.Infoln("decompress dir:", sourceDir)
 
@@ -168,115 +213,102 @@ func DownloadKernel(report *parse.CrashReport) error {
 			}
 		}()
 
-		//bar := progressbar.NewOptions(-1, progressbar.OptionSetDescription("downloading"))
-
 		_, err = io.Copy(io.Writer(outFile), resp.Body)
 		if err != nil {
 			return err
 		}
-		//err = bar.Finish()
-		//if err != nil {
-		//	return err
-		//}
-		log.Infoln("\ndownload linux tar success")
+
+		log.Infoln("download linux tar success")
 	}
 
-	exists, err := dirExistsAndNotEmpty(sourceDir)
+	f, err := os.Open(tarFilePath)
 	if err != nil {
 		return err
 	}
-	if exists {
-		log.Infoln("target dir already exists, skip decompress", fileName)
-	} else {
-		f, err := os.Open(tarFilePath)
+
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Errorln(err)
+		}
+	}()
+
+	gzReader, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := gzReader.Close(); err != nil {
+			log.Errorln(err)
+		}
+	}()
+
+	tarReader := tar.NewReader(gzReader)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
+			log.Error(err)
 			return err
 		}
 
-		defer func() {
-			if err := f.Close(); err != nil {
-				log.Errorln(err)
-			}
-		}()
-
-		gzReader, err := gzip.NewReader(f)
-		if err != nil {
-			return err
+		target := filepath.Join(saveDir, header.Name)
+		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(saveDir)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path in archive: %s", target)
 		}
-		defer func() {
-			if err := gzReader.Close(); err != nil {
-				log.Errorln(err)
-			}
-		}()
 
-		tarReader := tar.NewReader(gzReader)
-		for {
-			header, err := tarReader.Next()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Error(err)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
 				return err
 			}
-
-			target := filepath.Join(saveDir, header.Name)
-			if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(saveDir)+string(os.PathSeparator)) {
-				return fmt.Errorf("illegal file path in archive: %s", target)
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
 			}
-
-			switch header.Typeflag {
-			case tar.TypeDir:
-				if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
-					return err
-				}
-			case tar.TypeReg:
-				if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-					return err
-				}
-				outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(outFile, tarReader); err != nil {
+				err := outFile.Close()
 				if err != nil {
 					return err
 				}
-				if _, err := io.Copy(outFile, tarReader); err != nil {
-					err := outFile.Close()
-					if err != nil {
-						return err
-					}
-					return err
-				}
-				if err := outFile.Close(); err != nil {
-					return err
-				}
-			case tar.TypeSymlink:
-				if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-					return err
-				}
-				if err := os.Symlink(header.Linkname, target); err != nil {
-					return fmt.Errorf("failed create symbol link: %s -> %s (%v)", target, header.Linkname, err)
-				}
-			case tar.TypeLink:
-				linkTarget := filepath.Join(saveDir, header.Linkname)
-				if err := os.Link(linkTarget, target); err != nil {
-					return fmt.Errorf("failed create hard symbol link: %s -> %s (%v)", target, linkTarget, err)
-				}
-			default:
-				log.Debugf("skip type (not support): %s (%c)\n", header.Name, header.Typeflag)
+				return err
 			}
+			if err := outFile.Close(); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return fmt.Errorf("failed create symbol link: %s -> %s (%v)", target, header.Linkname, err)
+			}
+		case tar.TypeLink:
+			linkTarget := filepath.Join(saveDir, header.Linkname)
+			if err := os.Link(linkTarget, target); err != nil {
+				return fmt.Errorf("failed create hard symbol link: %s -> %s (%v)", target, linkTarget, err)
+			}
+		default:
+			log.Debugf("skip type (not support): %s (%c)\n", header.Name, header.Typeflag)
 		}
-		log.Infoln("decompress tar success, linux kernel exists", sourceDir)
 	}
+	log.Infoln("decompress tar success, linux kernel exists", sourceDir)
 
 	return nil
 }
 
-// DownloadBug download bug reproducer file (c file)
+// download bug reproducer file (c file)
 func DownloadBug(report *parse.CrashReport) error {
 	if GlobalToolChain == nil {
 		return errors.New("toolchain not initialized")
 	}
 
-	proxyURL, _ := url.Parse("http://127.0.0.1:7890")
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%s", config.GlobalConfig.Port))
 	transport := &http.Transport{
 		Proxy: http.ProxyURL(proxyURL),
 	}
@@ -299,8 +331,6 @@ func DownloadBug(report *parse.CrashReport) error {
 		}
 	}()
 
-	//total := resp.ContentLength
-
 	outFile, err := os.Create(reproducerFile)
 	if err != nil {
 		return err
@@ -311,25 +341,10 @@ func DownloadBug(report *parse.CrashReport) error {
 		}
 	}()
 
-	//var bar *progressbar.ProgressBar
-	//if total < 0 {
-	//	bar = progressbar.NewOptions(-1, progressbar.OptionSetDescription("downloading"))
-	//} else {
-	//	bar = progressbar.DefaultBytes(
-	//		total,
-	//		"downloading",
-	//	)
-	//}
-
 	_, err = io.Copy(io.Writer(outFile), resp.Body)
 	if err != nil {
 		return err
 	}
-
-	//err = bar.Finish()
-	//if err != nil {
-	//	return err
-	//}
 
 	fmt.Println("")
 	log.Infoln("download c reproducer success")
@@ -337,13 +352,13 @@ func DownloadBug(report *parse.CrashReport) error {
 	return nil
 }
 
-// DownloadConfig download config form syzkaller
+// download config form syzkaller
 func DownloadConfig(report *parse.CrashReport) error {
 	if GlobalToolChain == nil {
 		return errors.New("toolchain not initialized")
 	}
 
-	proxyURL, _ := url.Parse("http://127.0.0.1:7890")
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%s", config.GlobalConfig.Port))
 	transport := &http.Transport{
 		Proxy: http.ProxyURL(proxyURL),
 	}
@@ -369,8 +384,6 @@ func DownloadConfig(report *parse.CrashReport) error {
 			}
 		}()
 
-		//total := resp.ContentLength
-
 		outFile, err := os.Create(configFile)
 		if err != nil {
 			return err
@@ -381,25 +394,11 @@ func DownloadConfig(report *parse.CrashReport) error {
 			}
 		}()
 
-		//var bar *progressbar.ProgressBar
-		//if total < 0 {
-		//	bar = progressbar.NewOptions(-1, progressbar.OptionSetDescription("downloading"))
-		//} else {
-		//	bar = progressbar.DefaultBytes(
-		//		total,
-		//		"downloading",
-		//	)
-		//}
-
 		_, err = io.Copy(io.Writer(outFile), resp.Body)
 		if err != nil {
 			return err
 		}
 
-		//err = bar.Finish()
-		//if err != nil {
-		//	return err
-		//}
 		fmt.Println("")
 		log.Infoln("download linux config success")
 	}
@@ -416,7 +415,6 @@ func DownloadConfig(report *parse.CrashReport) error {
 func checkFix(configPath string) error {
 	f, err := os.Open(configPath)
 	if err != nil {
-		log.Error(err)
 		return err
 	}
 	defer func() {
@@ -430,13 +428,24 @@ func checkFix(configPath string) error {
 	scanner := bufio.NewScanner(f)
 
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSpace(scanner.Text())
 		lines = append(lines, line)
+
+		if strings.HasPrefix(line, "# CONFIG_") && strings.HasSuffix(line, "is not set") {
+			// 解析禁用配置
+			key := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "# "), " is not set"))
+			configMap[key] = "n"
+			continue
+		}
+
 		if strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
 			continue
 		}
+
 		parts := strings.SplitN(line, "=", 2)
-		configMap[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		configMap[key] = value
 	}
 
 	log.Infof("using config file: %s\n", configPath)
@@ -448,42 +457,50 @@ func checkFix(configPath string) error {
 	for i, line := range lines {
 		for key, expected := range requiredConfigs {
 			if strings.HasPrefix(line, key+"=") || strings.HasPrefix(line, "# "+key+" is not set") {
+				found[key] = true
 				actual := configMap[key]
 				if actual != expected {
-					log.Infof("[✘] error config: %s (expected: %s)\n", key, expected)
-					lines[i] = fmt.Sprintf("%s=%s", key, expected)
+					log.Infof("[✘] error config: %s (expected: %s, actual: %s)\n", key, expected, actual)
+					if expected == "n" {
+						lines[i] = fmt.Sprintf("# %s is not set", key)
+					} else {
+						lines[i] = fmt.Sprintf("%s=%s", key, expected)
+					}
 					flag = false
 				} else {
 					log.Infof("[✔] %s=%s\n", key, expected)
 				}
-				found[key] = true
 			}
 		}
 	}
 
-	if !flag {
-		out, err := os.Create(configPath)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := out.Close(); err != nil {
-				log.Errorln(err)
+	for key, expected := range requiredConfigs {
+		if !found[key] {
+			log.Infof("[✘] missing config: %s (expected: %s)\n", key, expected)
+			if expected == "n" {
+				lines = append(lines, fmt.Sprintf("# %s is not set", key))
+			} else {
+				lines = append(lines, fmt.Sprintf("%s=%s", key, expected))
 			}
-		}()
-
-		writer := bufio.NewWriter(out)
-		for _, line := range lines {
-			_, _ = writer.WriteString(line + "\n")
+			flag = false
 		}
-		err = writer.Flush()
+	}
+
+	if !flag {
+		log.Infoln("updating config file...")
+
+		content := strings.Join(lines, "\n") + "\n"
+		err = os.WriteFile(configPath, []byte(content), 0644)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to write config file: %v", err)
 		}
 
 		log.Infoln("config updated. running \"make olddefconfig\"")
 
-		cmd := exec.Command("make", fmt.Sprintf("CC=%s", GlobalToolChain.CC), fmt.Sprintf("HOSTCC=%s", GlobalToolChain.CC), "olddefconfig")
+		cmd := exec.Command("make",
+			fmt.Sprintf("CC=%s", GlobalToolChain.CC),
+			fmt.Sprintf("HOSTCC=%s", GlobalToolChain.CC),
+			"olddefconfig")
 		cmd.Dir = filepath.Dir(configPath)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -491,6 +508,8 @@ func checkFix(configPath string) error {
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed execute \"make olddefconfig\": %v", err)
 		}
+	} else {
+		log.Infoln("all required configs are satisfied, no change needed.")
 	}
 
 	return nil
@@ -567,9 +586,19 @@ func setToolchain(report *parse.CrashReport) ToolChain {
 	compiler, version := configCompiler(report)
 	key, err := findToolchain(compiler, version)
 	if err != nil {
-		log.Panicf("Global Compiler Not Found: %s\n", err)
+		log.Infoln("Global Compiler Not Found:", err)
+		log.Infoln("Use Default Compiler:", compiler)
+		if compiler == "gcc" {
+			return defaultGCC
+		}
+		if compiler == "clang" {
+			return defaultClang
+		}
 	}
 	rootPath, _ := os.Getwd()
+	if compiler == "clang" {
+		flag = true
+	}
 	return ToolChain{
 		Name:    compiler + version,
 		Type:    compiler,
@@ -580,7 +609,7 @@ func setToolchain(report *parse.CrashReport) ToolChain {
 	}
 }
 
-// InitToolChain must be called once before any compile package function
+// must be called once before any compile package function
 func InitToolChain(report *parse.CrashReport) {
 	tc := setToolchain(report)
 	GlobalToolChain = &tc
@@ -603,35 +632,25 @@ func MakeKernel(report *parse.CrashReport) error {
 		return err
 	}
 
-	oldDir, err := os.Getwd()
-	path = filepath.Join(oldDir, path)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := os.Chdir(oldDir); err != nil {
-			log.Errorln(err)
-		}
-	}()
-
-	if err = os.Chdir(path); err != nil {
-		return err
-	}
-
 	env := buildEnv()
 
-	numCpu := runtime.NumCPU()
-	makeJobs := fmt.Sprintf("-j%d", numCpu-1)
+	numCPU := runtime.NumCPU() - 2
+	makeJobs := fmt.Sprintf("-j%d", numCPU)
 
 	configPath := filepath.Join(path, ".config")
 	if !fileExists(configPath) {
 		return errors.New("config file not found")
 	}
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Second * 2)
 	log.Infoln("starting kernel compilation in", path)
 
-	compileCmd := exec.Command("bear", "--", "make", makeJobs)
+	var compileCmd *exec.Cmd
+	if flag {
+		compileCmd = exec.Command("bear", "--", "make", "LLVM=1", makeJobs)
+	} else {
+		compileCmd = exec.Command("bear", "--", "make", makeJobs)
+	}
 	compileCmd.Env = env
 	compileCmd.Dir = path
 
@@ -640,7 +659,7 @@ func MakeKernel(report *parse.CrashReport) error {
 	compileCmd.Stdout = io.MultiWriter(stdout, logger.Writer())
 	compileCmd.Stderr = io.MultiWriter(stderr, logger.Writer())
 
-	err = compileCmd.Run()
+	err := compileCmd.Run()
 	if err != nil {
 		return fmt.Errorf("error compiling kernel: %s", err)
 	}
@@ -652,7 +671,7 @@ func MakeKernel(report *parse.CrashReport) error {
 		return fmt.Errorf("bzImage file not found: %s", bzImagePath)
 	}
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Second * 2)
 	log.Infoln("starting linux header install", path)
 
 	headerCmd := exec.Command("make", "headers_install", "INSTALL_HDR_PATH=./linux-header")
@@ -691,24 +710,120 @@ func ClearCompile(report *parse.CrashReport) error {
 }
 
 func ClearDownload(report *parse.CrashReport) error {
-	// !TODO: clear resources
-	// err = os.Remove(tarFilePath)
-	// if err != nil {
-	//	log.Error(err)
-	// return err
-	// }
-	// log.Infoln("decompress linux tar success")
+	if len(report.Crashes) == 0 {
+		return fmt.Errorf("no valid report data")
+	}
+
+	commit := report.Crashes[0].KernelSourceCommit
+	if commit == "" {
+		return fmt.Errorf("no valid kernel commit")
+	}
+
+	fileName := "linux-" + commit + ".tar.gz"
+
+	saveDir := "build/" + commit
+	tarFilePath := filepath.Join(saveDir, fileName)
+
+	err := os.Remove(tarFilePath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove file %s: %v", tarFilePath, err)
+	}
+	log.Infoln("removed file:", tarFilePath)
 	return nil
 }
 
 func GeneratePatch(report *parse.CrashReport, patch string) error {
+	if err := parse.WriteCustomPatch(report, "patch.diff", patch); err != nil {
+		return fmt.Errorf("failed to write patch file: %v", err)
+	}
+	log.Infoln("patch file generated successfully")
 	return nil
 }
 
 func ApplyPatch(report *parse.CrashReport) error {
+	applyCmd := exec.Command("git", "apply", "patch.diff")
+	applyCmd.Dir = kernelPath(report)
+	applyCmd.Stdout = os.Stdout
+	applyCmd.Stderr = os.Stderr
+	if err := applyCmd.Run(); err != nil {
+		return fmt.Errorf("failed to apply patch: %v", err)
+	}
+	log.Infoln("patch applied successfully")
 	return nil
 }
 
 func RebuildKernel(report *parse.CrashReport, patch string) error {
+	path := kernelPath(report)
+
+	logger := log.New()
+	logger.SetOutput(os.Stdout)
+	logger.SetFormatter(&log.TextFormatter{
+		FullTimestamp: true,
+	})
+
+	if GlobalToolChain == nil {
+		return errors.New("toolchain not initialized")
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return err
+	}
+
+	env := buildEnv()
+
+	numCPU := runtime.NumCPU() - 2
+	makeJobs := fmt.Sprintf("-j%d", numCPU)
+
+	configPath := filepath.Join(path, ".config")
+	if !fileExists(configPath) {
+		return errors.New("config file not found")
+	}
+
+	time.Sleep(time.Second * 2)
+	log.Infoln("starting kernel compilation in", path)
+
+	compileCmd := exec.Command("bear", "--output", "rebuild_compile_commands.json", "--", "make", makeJobs)
+	compileCmd.Env = env
+	compileCmd.Dir = path
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	compileCmd.Stdout = io.MultiWriter(stdout, logger.Writer())
+	compileCmd.Stderr = io.MultiWriter(stderr, logger.Writer())
+
+	err := compileCmd.Run()
+	if err != nil {
+		return fmt.Errorf("error compiling kernel: %s", err)
+	}
+
+	log.Infoln("compilation succeeded")
+
+	bzImagePath := filepath.Join(path, "arch/x86_64/boot/bzImage")
+	if _, err := os.Stat(bzImagePath); os.IsNotExist(err) {
+		return fmt.Errorf("bzImage file not found: %s", bzImagePath)
+	}
+
+	time.Sleep(time.Second * 2)
+	log.Infoln("starting linux header install", path)
+
+	headerCmd := exec.Command("make", "headers_install", "INSTALL_HDR_PATH=./linux-header")
+	headerCmd.Env = env
+	headerCmd.Dir = path
+	headerCmd.Stdout = io.MultiWriter(stdout, logger.Writer())
+	headerCmd.Stderr = io.MultiWriter(stderr, logger.Writer())
+
+	err = headerCmd.Run()
+	if err != nil {
+		return fmt.Errorf("error installing header: %s", err)
+	}
+
+	empty, err := dirExistsAndNotEmpty(filepath.Join(path, "linux-header"))
+	if err != nil {
+		return err
+	}
+	if !empty {
+		return errors.New("linux header not generated")
+	}
+
 	return nil
 }

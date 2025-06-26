@@ -31,16 +31,20 @@ const (
 
 var (
 	clientID   = flag.String("id", "worker1", "The unique ID for this client")
-	ServerAddr = flag.String("server", "localhost:50051", "The server address in the format of host:port")
+	ServerAddr = flag.String("server", "130.33.112.212:50051", "The server address in the format of host:port")
 	Command    = flag.String("Command", "", "An initial Command to execute and stream its output. If empty, client only polls for commands.")
 )
 
+// uploadArtifact 上传任务产物到服务器
 func uploadArtifact(ctx context.Context, httpClient *HttpClient, taskID string, localFilePath string) error {
-	log.Printf("准备为任务 %s 上传产物: %s\n", taskID, localFilePath)
+	log.WithFields(log.Fields{
+		"task_id":  taskID,
+		"filepath": localFilePath,
+	}).Info("preparing to upload artifact")
 
 	// 确保文件存在
 	if _, err := os.Stat(localFilePath); os.IsNotExist(err) {
-		return fmt.Errorf("文件不存在: %s", localFilePath)
+		return fmt.Errorf("file does not exist: %s", localFilePath)
 	}
 
 	// 准备上传内容
@@ -53,238 +57,342 @@ func uploadArtifact(ctx context.Context, httpClient *HttpClient, taskID string, 
 	// 执行上传
 	resp, err := httpClient.PostMultipartStream(uploadPath, nil, fileFields)
 	if err != nil {
-		return fmt.Errorf("上传产物失败: %w", err)
+		return fmt.Errorf("failed to upload artifact: %w", err)
 	}
 
 	if !resp.IsSuccess() {
-		return fmt.Errorf("上传产物失败，服务器响应: %d - %s", resp.StatusCode, resp.String())
+		return fmt.Errorf("failed to upload artifact, server response: %d - %s", resp.StatusCode, resp.String())
 	}
 
-	log.Printf("产物上传成功: %s\n", localFilePath)
+	log.WithField("filepath", localFilePath).Info("artifact uploaded successfully")
 	return nil
 }
 
+// ExecuteAndStreamLogs 执行命令并流式传输日志
 func ExecuteAndStreamLogs(ctx context.Context, client pb.LogStreamServiceClient, cmdStr string, httpClient *HttpClient) error {
-	log.Infof("Starting initial Command: '%s'", cmdStr)
+	log.WithField("command", cmdStr).Info("starting to execute command")
 
+	// 解析命令
 	cmdParts := strings.Fields(cmdStr)
-	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+	if len(cmdParts) == 0 {
+		return fmt.Errorf("command cannot be empty")
+	}
 
+	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+	cmd.Dir = "../build-vmcore"
+
+	// 创建管道
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Errorf("Failed to get stdout pipe for initial Command: %v", err)
-		return err
+		log.WithError(err).Error("failed to create stdout pipe")
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
+
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		log.Errorf("Failed to get stderr pipe for initial Command: %v", err)
-		return err
+		log.WithError(err).Error("failed to create stderr pipe")
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
+	// 创建日志流
 	stream, err := client.UploadLogs(ctx)
 	if err != nil {
-		log.Errorf("Could not open log stream: %v", err)
-		return err
+		log.WithError(err).Error("failed to create log stream")
+		return fmt.Errorf("failed to create log stream: %w", err)
 	}
+	defer func() {
+		if closeErr := stream.CloseSend(); closeErr != nil {
+			log.WithError(closeErr).Warn("failed to close log stream")
+		}
+	}()
 
+	// 启动命令
 	if err := cmd.Start(); err != nil {
-		log.Errorf("Failed to start initial Command: %v", err)
-		return err
+		log.WithError(err).Error("failed to start command")
+		return fmt.Errorf("failed to start command: %w", err)
 	}
 
+	// 并发处理输出流
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go streamPipe(stream, stdoutPipe, pb.LogLevel_INFO, &wg, ctx)
-	go streamPipe(stream, stderrPipe, pb.LogLevel_ERROR, &wg, ctx)
-	wg.Wait()
+	errChan := make(chan error, 2)
 
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := streamPipe(stream, stdoutPipe, "stdout", ctx); err != nil {
+			errChan <- fmt.Errorf("failed to process stdout: %w", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := streamPipe(stream, stderrPipe, "stderr", ctx); err != nil {
+			errChan <- fmt.Errorf("failed to process stderr: %w", err)
+		}
+	}()
+
+	// 等待所有goroutine完成
+	wg.Wait()
+	close(errChan)
+
+	// 检查流处理错误
+	for streamErr := range errChan {
+		log.WithError(streamErr).Warn("stream processing error occurred")
+	}
+
+	// 接收响应
 	resp, err := stream.CloseAndRecv()
 	if err != nil {
-		log.Errorf("Failed to receive closing response from LogStreamService: %v", err)
+		log.WithError(err).Error("failed to receive log stream response")
 	} else {
-		log.Infof("LogStreamService response: Success=%v, Message='%s'", resp.Success, resp.Message)
+		log.WithFields(log.Fields{
+			"success": resp.Success,
+			"message": resp.Message,
+		}).Info("log stream response received")
 	}
 
-	err = cmd.Wait()
+	// 等待命令完成并处理结果
+	cmdErr := cmd.Wait()
+	if err := reportTaskResult(ctx, httpClient, cmdErr); err != nil {
+		log.WithError(err).Error("failed to report task result")
+	}
+
+	log.WithField("command", cmdStr).Info("command execution completed")
+	return cmdErr
+}
+
+// reportTaskResult 报告任务执行结果
+func reportTaskResult(ctx context.Context, httpClient *HttpClient, cmdErr error) error {
+	taskID, ok := ctx.Value("taskID").(string)
+	if !ok {
+		return fmt.Errorf("cannot get taskID from context")
+	}
+
 	var payload map[string]interface{}
-	if err != nil {
-		// 命令失败，准备失败的 payload (省略细节)...
+	if cmdErr != nil {
 		var resultMessage string
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			resultMessage = fmt.Sprintf("命令执行失败, 退出码: %d.", exitErr.ExitCode())
+		if errors.As(cmdErr, &exitErr) {
+			resultMessage = fmt.Sprintf("command execution failed with exit code: %d", exitErr.ExitCode())
 		} else {
-			resultMessage = fmt.Sprintf("命令启动失败: %v", err)
+			resultMessage = fmt.Sprintf("command startup failed: %v", cmdErr)
 		}
 		payload = map[string]interface{}{
 			"status": StatusFailed,
 			"result": resultMessage,
 		}
 	} else {
-		// 命令成功，准备成功的 payload
 		payload = map[string]interface{}{
 			"status": StatusSuccess,
-			"result": "任务成功执行完成。",
+			"result": "task executed successfully",
+		}
+		if err := uploadTaskArtifact(ctx, httpClient); err != nil {
+			log.WithError(err).Error("failed to upload artifact")
+			payload = map[string]interface{}{
+				"status": StatusFailed,
+				"result": "failed to upload artifact",
+			}
 		}
 	}
-	taskUpdatePath := fmt.Sprintf("/api/v1/tasks/%s", ctx.Value("taskID").(string))
 
-	// 2. 准备 context 参数 (创建一个有5秒超时的子上下文)
+	taskUpdatePath := fmt.Sprintf("/api/v1/tasks/%s", taskID)
 	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	// 3. 调用 PatchWithContext，传入准备好的参数
-	response, patchErr := httpClient.PatchWithContext(reportCtx, taskUpdatePath, payload)
-
-	// 4. 对调用结果进行处理
-	if patchErr != nil {
-		// 网络请求本身就失败了
-		slog.Error("向服务端报告状态失败", "task_id", ctx.Value("taskID").(string), "error", patchErr)
+	response, err := httpClient.PatchWithContext(reportCtx, taskUpdatePath, payload)
+	if err != nil {
+		slog.Error("failed to report status to server",
+			slog.String("task_id", taskID),
+			slog.String("error", err.Error()))
 		return err
 	}
 
 	if !response.IsSuccess() {
-		slog.Error("服务端未能成功更新状态", "task_id", ctx.Value("taskID").(string), "status_code", response.StatusCode, "response", resp.String())
-	} else {
-		slog.Info("服务端状态更新成功", "task_id", ctx.Value("taskID").(string))
+		slog.Error("server failed to update status",
+			slog.String("task_id", taskID),
+			slog.Int("status_code", response.StatusCode),
+			slog.String("response", response.String()))
+		return fmt.Errorf("server failed to update status: %d", response.StatusCode)
 	}
-	log.Infof("Initial Command '%s' has finished.", cmdStr)
 
-	rootPath, _ := os.Getwd()
-	err = uploadArtifact(ctx, httpClient, ctx.Value("taskID").(string), filepath.Join(rootPath, fmt.Sprintf("build/%s/linux-%s.tar.zst", ctx.Value("taskCommit").(string), ctx.Value("taskCommit").(string))))
+	slog.Info("server status updated successfully", slog.String("task_id", taskID))
+	return nil
+}
+
+// uploadTaskArtifact 上传任务产物
+func uploadTaskArtifact(ctx context.Context, httpClient *HttpClient) error {
+	taskID, ok := ctx.Value("taskID").(string)
+	if !ok {
+		return fmt.Errorf("cannot get taskID from context")
+	}
+
+	taskCommit, ok := ctx.Value("taskCommit").(string)
+	if !ok {
+		return fmt.Errorf("cannot get taskCommit from context")
+	}
+
+	rootPath, err := os.Getwd()
 	if err != nil {
-		log.Errorf("Failed to upload artifact: %v", err)
-		return err
+		return fmt.Errorf("failed to get current working directory: %w", err)
+	}
+
+	artifactPath := filepath.Join(rootPath,
+		fmt.Sprintf("../build-vmcore/build/%s/linux-%s.tar.zst", taskCommit, taskCommit))
+
+	return uploadArtifact(ctx, httpClient, taskID, artifactPath)
+}
+
+// streamPipe 处理管道流并发送到日志服务
+func streamPipe(stream pb.LogStreamService_UploadLogsClient, reader io.Reader, streamType string, ctx context.Context) error {
+	taskID, ok := ctx.Value("taskID").(string)
+	workID, ok := ctx.Value("workerID").(string)
+	if !ok {
+		return fmt.Errorf("cannot get taskID from context")
+	}
+
+	scanner := bufio.NewScanner(reader)
+	// 设置更大的缓冲区以处理长行
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		fmt.Printf("%s\n", scanner.Text())
+
+		// 根据proto文件，LogMessage只有client_id, task_id, timestamp, message字段
+		msg := &pb.LogMessage{
+			ClientId:  workID,
+			TaskId:    taskID,
+			Message:   scanner.Text(),
+			Timestamp: time.Now().Format(time.RFC3339Nano),
+		}
+
+		if err := stream.Send(msg); err != nil {
+			log.WithError(err).Error("failed to send log message")
+			return fmt.Errorf("failed to send log message: %w", err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.WithFields(log.Fields{
+			"stream_type": streamType,
+			"error":       err,
+		}).Error("error reading from pipe")
+		return fmt.Errorf("error reading from pipe (%s): %w", streamType, err)
 	}
 
 	return nil
 }
 
-func streamPipe(stream pb.LogStreamService_UploadLogsClient, reader io.Reader, level pb.LogLevel, wg *sync.WaitGroup, ctx context.Context) {
-	defer wg.Done()
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		msg := &pb.LogMessage{
-			ClientId:  ctx.Value("taskID").(string),
-			Level:     level,
-			Message:   scanner.Text(),
-			Timestamp: time.Now().Format(time.RFC3339Nano),
-		}
-		if err := stream.Send(msg); err != nil {
-			log.Errorf("Failed to send log message: %v", err)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Errorf("Error reading from pipe (%s): %v", level.String(), err)
-	}
-}
-
+// pollForCommands 轮询服务器获取命令
 func pollForCommands(ctx context.Context, client pb.CommandServiceClient) {
-	log.Info("Starting to poll for commands every 10 seconds...")
+	log.Info("starting to poll for commands every 10 seconds")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info("Stopping Command polling.")
+			log.Info("stopping command polling")
 			return
 		case <-ticker.C:
-			ping := &pb.PingCommand{
-				ClientId: *clientID,
-				Time:     time.Now().Format(time.RFC3339Nano),
+			if err := pollSingleCommand(ctx, client); err != nil {
+				log.WithError(err).Error("failed to poll command")
 			}
-
-			log.Debug("Pinging server for commands...")
-			cmd, err := client.GetCommand(ctx, ping)
-			if err != nil {
-				log.Errorf("Failed to get Command from server: %v", err)
-				continue
-			}
-
-			if cmd.NoCommandAvailable {
-				log.Debug("No Command available from server.")
-				continue
-			}
-
-			handleCommand(ctx, cmd)
 		}
 	}
 }
 
+// pollSingleCommand 执行单次命令轮询
+func pollSingleCommand(ctx context.Context, client pb.CommandServiceClient) error {
+	ping := &pb.PingCommand{
+		ClientId: *clientID,
+		Time:     time.Now().Format(time.RFC3339Nano),
+	}
+
+	log.Debug("sending ping request to server")
+
+	// 添加超时控制
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cmd, err := client.GetCommand(pingCtx, ping)
+	if err != nil {
+		return fmt.Errorf("failed to get command: %w", err)
+	}
+
+	if cmd.NoCommandAvailable {
+		log.Debug("no command available from server")
+		return nil
+	}
+
+	handleCommand(ctx, cmd)
+	return nil
+}
+
+// handleCommand 处理接收到的命令
 func handleCommand(ctx context.Context, cmd *pb.Command) {
-	log.Infof("Received Command: ID=%s, Type=%s, Target=%s, Payload=%s",
-		cmd.CommandId, cmd.Type, cmd.TargetClient, cmd.Payload)
+	log.WithFields(log.Fields{
+		"command_id":    cmd.CommandId,
+		"type":          cmd.Type.String(),
+		"target_client": cmd.TargetClient,
+		"payload":       cmd.Payload,
+	}).Info("received command")
 
 	switch cmd.Type {
 	case pb.CommandType_PONG:
-		log.Info("Received a PONG Command from the server.")
+		log.Info("received PONG command")
 
 	case pb.CommandType_EXECUTE_SHELL:
-		log.Info("Executing shell Command...")
-		execCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
-		defer cancel()
-
-		cmdParts := strings.Fields(cmd.Payload)
-		shellCmd := exec.CommandContext(execCtx, cmdParts[0], cmdParts[1:]...)
-
-		output, err := shellCmd.CombinedOutput()
-		if err != nil {
-			log.Errorf("Error executing shell Command '%s': %v. Output: %s", cmd.Payload, err, string(output))
-		} else {
-			log.Infof("Shell Command '%s' executed successfully. Output:\n%s", cmd.Payload, string(output))
-		}
+		handleShellCommand(ctx, cmd)
 
 	case pb.CommandType_OPEN_SSH, pb.CommandType_OPEN_QEMU_MONITOR:
-		log.Warnf("Received Command type %s, but interactive sessions are not yet implemented.", cmd.Type)
-		// !TODO 在这里可以添加启动 TransportService 双向流的逻辑
+		log.WithField("type", cmd.Type.String()).Warn("received command type, but interactive sessions are not yet implemented")
+		// TODO: 在这里可以添加启动 TransportService 双向流的逻辑
+
+	case pb.CommandType_RESTART_SERVICE:
+		log.WithField("type", cmd.Type.String()).Info("received restart service command")
+		// TODO: 实现服务重启逻辑
+
+	case pb.CommandType_CUSTOM:
+		log.WithField("type", cmd.Type.String()).Info("received custom command")
+		// TODO: 实现自定义命令处理逻辑
 
 	default:
-		log.Warnf("Received unknown or unsupported Command type: %s", cmd.Type)
+		log.WithField("type", cmd.Type.String()).Warn("received unknown or unsupported command type")
 	}
 }
 
-//func main() {
-//	flag.Parse()
-//	log.SetLevel(log.InfoLevel)
-//
-//	// 1. 建立 gRPC 连接
-//	log.Infof("Client '%s' starting, connecting to gRPC server at %s", *clientID, *ServerAddr)
-//	conn, err := grpc.Dial(*ServerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-//	if err != nil {
-//		log.Fatalf("Failed to connect: %v", err)
-//	}
-//	defer conn.Close()
-//
-//	// 2. 为所有服务创建客户端实例
-//	logServiceClient := pb.NewLogStreamServiceClient(conn)
-//	commandServiceClient := pb.NewCommandServiceClient(conn)
-//	// transportServiceClient := pb.NewTransportServiceClient(conn) // 暂未使用
-//
-//	// 使用上下文来统一管理所有 goroutine 的生命周期
-//	ctx, cancel := context.WithCancel(context.Background())
-//	defer cancel()
-//
-//	var wg sync.WaitGroup
-//
-//	// 3. 启动命令轮询 goroutine
-//	wg.Add(1)
-//	go func() {
-//		defer wg.Done()
-//		pollForCommands(ctx, commandServiceClient)
-//	}()
-//
-//	// 4. 如果提供了初始命令，则启动日志上传 goroutine
-//	if *Command != "" {
-//		wg.Add(1)
-//		go func() {
-//			defer wg.Done()
-//			executeAndStreamLogs(ctx, logServiceClient, *Command)
-//		}()
-//	}
-//
-//	log.Info("Client is running. Press Ctrl+C to exit.")
-//	wg.Wait() // 等待所有核心任务结束
-//	log.Info("Client shutting down.")
-//}
+// handleShellCommand 处理shell命令执行
+func handleShellCommand(ctx context.Context, cmd *pb.Command) {
+	log.WithField("payload", cmd.Payload).Info("executing shell command")
+
+	if strings.TrimSpace(cmd.Payload) == "" {
+		log.Error("shell command payload is empty")
+		return
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, 5*time.Minute) // 增加超时时间
+	defer cancel()
+
+	cmdParts := strings.Fields(cmd.Payload)
+	shellCmd := exec.CommandContext(execCtx, cmdParts[0], cmdParts[1:]...)
+
+	output, err := shellCmd.CombinedOutput()
+	if err != nil {
+		log.WithFields(log.Fields{
+			"command": cmd.Payload,
+			"error":   err,
+			"output":  string(output),
+		}).Error("shell command execution failed")
+	} else {
+		log.WithFields(log.Fields{
+			"command": cmd.Payload,
+			"output":  string(output),
+		}).Info("shell command executed successfully")
+	}
+}

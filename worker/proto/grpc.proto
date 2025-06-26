@@ -36,17 +36,9 @@ message CMDCommand {
 
 message LogMessage {
   string client_id = 1;
-  string timestamp = 2;
-  LogLevel level = 3;
+  string task_id = 2;
+  string timestamp = 3;
   string message = 4;
-}
-
-enum LogLevel {
-  DEBUG = 0;
-  INFO = 1;
-  WARN = 2;
-  ERROR = 3;
-  FATAL = 4;
 }
 
 message UploadLogsResponse {

@@ -3,6 +3,7 @@ package workflow
 import (
 	"backend/pkg/compile"
 	"backend/pkg/compress"
+	"backend/pkg/config"
 	"backend/pkg/kvm"
 	"backend/pkg/parse"
 	"fmt"
@@ -14,7 +15,20 @@ import (
 )
 
 func sleep() {
-	time.Sleep(time.Second * 1)
+	time.Sleep(time.Second * 2)
+}
+
+func WalkDir(callback func(data *parse.CrashReport), dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fmt.Println("读取目录出错:", err)
+		return
+	}
+
+	for _, entry := range entries {
+		data := parse.Parse(filepath.Join(dir, entry.Name()))
+		callback(&data)
+	}
 }
 
 func CompileKernel(f string) error {
@@ -23,37 +37,45 @@ func CompileKernel(f string) error {
 	compile.InitToolChain(&data)
 
 	if err := compile.DownloadKernel(&data); err != nil {
+		log.Errorln(err)
 		return err
 	}
+
 	sleep()
+
 	if err := compile.DownloadConfig(&data); err != nil {
+		log.Errorln(err)
 		return err
 	}
+
 	sleep()
+
 	if err := compile.DownloadBug(&data); err != nil {
+		log.Errorln(err)
 		return err
 	}
+
 	sleep()
+
 	if err := compile.MakeKernel(&data); err != nil {
+		log.Errorln(err)
 		return err
 	}
+
 	sleep()
-	if err := kvm.ConfigImage(&data); err != nil {
-		return err
-	}
-	sleep()
+
 	log.Infoln("compile successfully")
 	return nil
 }
 
 func BuildKernel(report *parse.CrashReport) error {
 	if err := kvm.GetVmcore(report); err != nil {
+		log.Errorln(err)
 		return err
 	}
+
 	sleep()
-	if err := compress.Compress(report); err != nil {
-		return err
-	}
+
 	log.Infoln("build target directory successfully")
 	return nil
 }
@@ -72,21 +94,6 @@ func ClearKernel(f string) error {
 	}
 	log.Infoln("clear successfully")
 	return nil
-}
-
-func WalkDir(callback func(data *parse.CrashReport)) {
-	dir := "/home/arch/TraceGPT/backend/kernel-benchmark"
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		fmt.Println("读取目录出错:", err)
-		return
-	}
-
-	for _, entry := range entries {
-		data := parse.Parse(filepath.Join(dir, entry.Name()))
-		callback(&data)
-	}
 }
 
 func SSHConnect() *kvm.SSHManager {
@@ -123,7 +130,7 @@ func QEMUVMConnect(report *parse.CrashReport) (*kvm.QEMUManager, error) {
 	config := kvm.VMConfig{
 		ImagePath:    filepath.Join(workPath, fmt.Sprintf("work/%s/debian.img", commit)),
 		KernelPath:   filepath.Join(workPath, fmt.Sprintf("work/%s/bzImage", commit)),
-		Memory:       "2048",
+		Memory:       config.GlobalConfig.VM.Memory,
 		MonitorPort:  4444,
 		KernelAppend: "root=/dev/sda console=ttyS0,115200n8 rw crashkernel=256M",
 		LogFile:      filepath.Join(workPath, fmt.Sprintf("log/%s.log", commit)),
@@ -134,14 +141,103 @@ func QEMUVMConnect(report *parse.CrashReport) (*kvm.QEMUManager, error) {
 	return q, err
 }
 
+// kexec -p /boot/crash-bzImage --initrd=/boot/crash-initramfs.cpio.gz --append="root=/dev/ram0 console=ttyS0"
 func Kexec(sshManager *kvm.SSHManager) error {
 	return SSHExecute("kexec -p /boot/crash-bzImage --initrd=/boot/crash-initramfs.cpio.gz --append=\"root=/dev/ram0 console=ttyS0\"", sshManager)
 }
 
 func Gcc(sshManager *kvm.SSHManager) error {
-	return SSHExecute("gcc bug.c -o bug", sshManager)
+	return SSHExecute("gcc bug.c -o bug -static", sshManager)
 }
 
 func Bug(sshManager *kvm.SSHManager) error {
 	return SSHExecute("./bug", sshManager)
+}
+
+func Compile(f string) error {
+	log.Infof("starting compile kernel with file: %s", f)
+
+	err := CompileKernel(f)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func Generate(f string) error {
+	log.Infof("starting generate vmcore with file: %s", f)
+
+	data := parse.Parse(f)
+
+	if err := kvm.ConfigImage(&data); err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	sleep()
+
+	vm, err := QEMUVMConnect(&data)
+	if err != nil {
+		return err
+	}
+	resp, err := vm.GetVMStatus()
+	if err != nil {
+		log.Errorf("failed to get VM status: %v", err)
+	}
+
+	log.Infof(resp)
+	defer func() {
+		if err := vm.ShutdownVM(); err != nil {
+			log.Errorln(err)
+		}
+	}()
+
+	ssh := SSHConnect()
+	if err = Kexec(ssh); err != nil {
+		log.Errorln(err)
+	}
+	if err = Gcc(ssh); err != nil {
+		log.Errorln(err)
+	}
+	if err = Bug(ssh); err != nil {
+		log.Errorln(err)
+	}
+	time.Sleep(time.Second * 15)
+
+	if err = BuildKernel(&data); err != nil {
+		return err
+	}
+	log.Infoln("generate vmcore successfully!")
+	return nil
+}
+
+func Compress(f string) error {
+	log.Infof("starting compress with file: %s", f)
+
+	data := parse.Parse(f)
+	if err := compress.Compress(&data); err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	log.Infoln("compress successfully")
+	return nil
+}
+
+func Clean(f string) error {
+	log.Infof("starting clean with file: %s", f)
+
+	if err := ClearKernel(f); err != nil {
+		log.Errorln(err)
+	}
+
+	log.Infoln("clean successfully")
+	return nil
+}
+
+func Patch(f string, path string) error {
+	log.Infof("starting patch with file: %s, path: %s", f, path)
+	// !TODO
+	log.Infoln("patch apply successfully!")
+	return nil
 }

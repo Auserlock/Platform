@@ -1,18 +1,22 @@
 package main
 
 import (
-	"Server/pkg/grpc"
+	rpc "Server/pkg/grpc"
 	"Server/pkg/manager"
 	pb "Server/pkg/proto"
 	"Server/pkg/router"
 	"Server/pkg/websocket"
-	"github.com/lmittmann/tint"
-	log "github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
 	"log/slog"
 	"net"
 	"os"
 	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/lmittmann/tint"
+	log "github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 func init() {
@@ -41,6 +45,13 @@ func init() {
 }
 
 func main() {
+	gin.SetMode(gin.DebugMode)
+
+	kaep := keepalive.EnforcementPolicy{
+		MinTime:             30 * time.Second,
+		PermitWithoutStream: true,
+	}
+
 	wsHub := websocket.NewHub()
 	go wsHub.Run()
 
@@ -50,7 +61,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to listen: %v", err)
 		}
-		gRPCServer := grpc.NewServer()
+		gRPCServer := grpc.NewServer(grpc.KeepaliveEnforcementPolicy(kaep))
 		logServer := rpc.NewLogStreamServer(wsHub)
 		pb.RegisterLogStreamServiceServer(gRPCServer, logServer)
 		if err := gRPCServer.Serve(lis); err != nil {
@@ -78,10 +89,9 @@ func main() {
 	workerMgr := manager.CreateWorkerManager(manager.DB, slog.Default(), workerTimeout, cleanupInterval)
 
 	r := router.SetupRouter(rmqClient, manager.DB, workerMgr, wsHub)
-	err = r.Run(":8080")
+	err = r.Run("0.0.0.0:8080")
 	if err != nil {
 		slog.Error(err.Error())
 		panic(err)
-		return
 	}
 }

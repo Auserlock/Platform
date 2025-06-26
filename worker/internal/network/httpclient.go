@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,7 @@ type HttpClient struct {
 	client  *http.Client
 	baseURL string
 	headers map[string]string
+	mu      sync.RWMutex
 }
 
 type Config struct {
@@ -39,13 +41,20 @@ func NewClient(config *Config) *HttpClient {
 		config = &Config{}
 	}
 
-	// 为常规请求设置一个默认超时
+	// 设置合理的默认超时时间
 	timeout := config.Timeout
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
 
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 
 	headers := make(map[string]string)
 	if config.Headers != nil {
@@ -56,16 +65,20 @@ func NewClient(config *Config) *HttpClient {
 
 	return &HttpClient{
 		client:  client,
-		baseURL: config.BaseURL,
+		baseURL: strings.TrimRight(config.BaseURL, "/"),
 		headers: headers,
 	}
 }
 
 func (c *HttpClient) SetHeader(key, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.headers[key] = value
 }
 
 func (c *HttpClient) SetHeaders(headers map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for k, v := range headers {
 		c.headers[k] = v
 	}
@@ -75,36 +88,55 @@ func (c *HttpClient) buildURL(path string) string {
 	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
 		return path
 	}
-	return strings.TrimRight(c.baseURL, "/") + "/" + strings.TrimLeft(path, "/")
+	if c.baseURL == "" {
+		return strings.TrimLeft(path, "/")
+	}
+	return c.baseURL + "/" + strings.TrimLeft(path, "/")
 }
 
 func (c *HttpClient) doRequest(ctx context.Context, method, url string, body io.Reader, headers map[string]string) (*Response, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("context cannot be nil")
+	}
+	if method == "" {
+		return nil, fmt.Errorf("HTTP method cannot be empty")
+	}
+	if url == "" {
+		return nil, fmt.Errorf("URL cannot be empty")
+	}
+
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// 应用客户端的全局 headers
+	// 线程安全地应用全局 headers
+	c.mu.RLock()
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
+	c.mu.RUnlock()
 
-	// 应用本次请求特定的 headers
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 
-	// 为了让 context 完全控制请求的生命周期（特别是超时），
-	// 我们克隆原始客户端以继承其所有设置（例如 Transport），然后禁用其固有的 Timeout。
-	// 这可以防止 http.Client.Timeout 与 context 的超时发生冲突。
-	requestClient := *c.client
-	requestClient.Timeout = 0
+	requestClient := &http.Client{
+		Transport:     c.client.Transport,
+		CheckRedirect: c.client.CheckRedirect,
+		Jar:           c.client.Jar,
+		Timeout:       0,
+	}
 
 	resp, err := requestClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to do request: %w", err)
+		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			_ = closeErr
+		}
+	}()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -120,7 +152,6 @@ func (c *HttpClient) doRequest(ctx context.Context, method, url string, body io.
 }
 
 func (c *HttpClient) Get(path string, params map[string]string, headers ...map[string]string) (*Response, error) {
-	// 为常规请求应用默认的短超时
 	ctx, cancel := context.WithTimeout(context.Background(), c.client.Timeout)
 	defer cancel()
 	return c.GetWithContext(ctx, path, params, headers...)
@@ -132,7 +163,7 @@ func (c *HttpClient) GetWithContext(ctx context.Context, path string, params map
 	if len(params) > 0 {
 		u, err := url.Parse(fullURL)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse url: %w", err)
+			return nil, fmt.Errorf("failed to parse URL '%s': %w", fullURL, err)
 		}
 		q := u.Query()
 		for k, v := range params {
@@ -206,19 +237,20 @@ func (c *HttpClient) requestWithBody(ctx context.Context, method, path string, d
 		switch v := data.(type) {
 		case string:
 			body = strings.NewReader(v)
-			contentType = "text/plain"
+			contentType = "text/plain; charset=utf-8"
 		case []byte:
 			body = bytes.NewReader(v)
 			contentType = "application/octet-stream"
 		case io.Reader:
 			body = v
+			contentType = "application/octet-stream" // 为 io.Reader 设置默认 Content-Type
 		default:
 			jsonData, err := json.Marshal(data)
 			if err != nil {
-				return nil, fmt.Errorf("failed marshal json: %w", err)
+				return nil, fmt.Errorf("failed to marshal JSON: %w", err)
 			}
 			body = bytes.NewReader(jsonData)
-			contentType = "application/json"
+			contentType = "application/json; charset=utf-8"
 		}
 	}
 
@@ -243,6 +275,10 @@ func (c *HttpClient) PostForm(path string, data map[string]string, headers ...ma
 }
 
 func (c *HttpClient) PostFormWithContext(ctx context.Context, path string, data map[string]string, headers ...map[string]string) (*Response, error) {
+	if data == nil {
+		return nil, fmt.Errorf("form data cannot be nil")
+	}
+
 	form := url.Values{}
 	for k, v := range data {
 		form.Set(k, v)
@@ -262,41 +298,44 @@ func (c *HttpClient) PostFormWithContext(ctx context.Context, path string, data 
 	return c.doRequest(ctx, http.MethodPost, fullURL, body, reqHeaders)
 }
 
-// PostMultipart (旧方法): 将文件读入内存后上传
+// PostMultipart: 将文件读入内存后上传（适用于小文件）
 func (c *HttpClient) PostMultipart(path string, data map[string]string, files map[string]string) (*Response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.client.Timeout)
 	defer cancel()
 	return c.PostMultipartWithContext(ctx, path, data, files)
 }
 
-// PostMultipartWithContext (旧方法): 将文件读入内存后上传
+// PostMultipartWithContext: 将文件读入内存后上传（适用于小文件）
 func (c *HttpClient) PostMultipartWithContext(ctx context.Context, path string, data map[string]string, files map[string]string) (*Response, error) {
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	for key, val := range data {
-		_ = writer.WriteField(key, val)
+	if data == nil && files == nil {
+		return nil, fmt.Errorf("both data and files cannot be nil")
 	}
 
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	defer func() {
+		if closeErr := writer.Close(); closeErr != nil {
+			// 记录关闭错误
+			_ = closeErr
+		}
+	}()
+
+	// 写入文本字段
+	for key, val := range data {
+		if err := writer.WriteField(key, val); err != nil {
+			return nil, fmt.Errorf("failed to write form field '%s': %w", key, err)
+		}
+	}
+
+	// 处理文件字段
 	for key, filePath := range files {
-		file, err := os.Open(filePath)
-		if err != nil {
-			return nil, fmt.Errorf("打开文件 %s 失败: %w", filePath, err)
-		}
-		defer file.Close()
-
-		part, err := writer.CreateFormFile(key, filepath.Base(filePath))
-		if err != nil {
-			return nil, fmt.Errorf("为文件 %s 创建 form-data part 失败: %w", filePath, err)
-		}
-
-		if _, err = io.Copy(part, file); err != nil {
-			return nil, fmt.Errorf("拷贝文件 %s 内容失败: %w", filePath, err)
+		if err := c.addFileToMultipart(writer, key, filePath); err != nil {
+			return nil, err
 		}
 	}
 
 	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("关闭 multipart writer 失败: %w", err)
+		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
 	reqHeaders := make(map[string]string)
@@ -306,65 +345,69 @@ func (c *HttpClient) PostMultipartWithContext(ctx context.Context, path string, 
 	return c.doRequest(ctx, http.MethodPost, fullURL, body, reqHeaders)
 }
 
-// PostMultipartStream: 使用流式方法上传文件，内置了10分钟的超时时间。
+func (c *HttpClient) addFileToMultipart(writer *multipart.Writer, fieldName, filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file '%s': %w", filePath, err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			// 记录文件关闭错误
+			_ = closeErr
+		}
+	}()
+
+	part, err := writer.CreateFormFile(fieldName, filepath.Base(filePath))
+	if err != nil {
+		return fmt.Errorf("failed to create form file for '%s': %w", filePath, err)
+	}
+
+	if _, err = io.Copy(part, file); err != nil {
+		return fmt.Errorf("failed to copy file content for '%s': %w", filePath, err)
+	}
+
+	return nil
+}
+
+// PostMultipartStream: 使用流式方法上传文件，内置10分钟超时（适用于大文件）
 func (c *HttpClient) PostMultipartStream(path string, data map[string]string, files map[string]string) (*Response, error) {
-	// 为流式上传创建一个带有10分钟超时的专用上下文。
+	// 为大文件上传设置更长的超时时间
 	uploadCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	// 确保在函数返回后（无论成功还是失败）都能释放上下文相关资源。
 	defer cancel()
 
-	// 使用带有长超时的上下文来调用实际的执行函数。
 	return c.PostMultipartStreamWithContext(uploadCtx, path, data, files)
 }
 
-// PostMultipartStreamWithContext: 允许调用者传入自定义的上下文，以实现更精细的超时控制或取消操作。
+// PostMultipartStreamWithContext: 允许自定义上下文的流式上传
 func (c *HttpClient) PostMultipartStreamWithContext(ctx context.Context, path string, data map[string]string, files map[string]string) (*Response, error) {
+	if data == nil && files == nil {
+		return nil, fmt.Errorf("both data and files cannot be nil")
+	}
+
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
 
+	// 在单独的 goroutine 中写入数据
 	go func() {
-		// 【核心修改】将写入逻辑包装在一个函数中，以便更清晰地处理错误和资源关闭。
-		// 在 goroutine 退出时，总是关闭管道写入器，并传递遇到的任何错误。
-		var err error
 		defer func() {
-			pw.CloseWithError(err)
+			// 确保管道写入端总是被关闭
+			if closeErr := pw.Close(); closeErr != nil {
+				// 记录关闭错误
+				_ = closeErr
+			}
 		}()
 
-		// 写入文本字段
-		for key, val := range data {
-			if err = writer.WriteField(key, val); err != nil {
-				err = fmt.Errorf("写入表单字段 %s 失败: %w", key, err)
-				return
-			}
+		if err := c.writeMultipartData(writer, data, files); err != nil {
+			// 将错误传递给管道读取端
+			pw.CloseWithError(err)
+			return
 		}
 
-		// 写入文件字段
-		for key, filePath := range files {
-			var file *os.File
-			file, err = os.Open(filePath)
-			if err != nil {
-				err = fmt.Errorf("打开文件 %s 失败: %w", filePath, err)
-				return
-			}
-			defer file.Close()
-
-			var part io.Writer
-			part, err = writer.CreateFormFile(key, filepath.Base(filePath))
-			if err != nil {
-				err = fmt.Errorf("为文件 %s 创建 form-data part 失败: %w", filePath, err)
-				return
-			}
-
-			if _, err = io.Copy(part, file); err != nil {
-				err = fmt.Errorf("拷贝文件 %s 内容失败: %w", filePath, err)
-				return
-			}
+		// 成功完成数据写入
+		if err := writer.Close(); err != nil {
+			pw.CloseWithError(fmt.Errorf("failed to close multipart writer: %w", err))
+			return
 		}
-
-		// 至关重要：必须在所有部分写入后关闭 multipart writer，
-		// 这会写入最后的边界标记。
-		err = writer.Close()
-
 	}()
 
 	reqHeaders := make(map[string]string)
@@ -374,14 +417,58 @@ func (c *HttpClient) PostMultipartStreamWithContext(ctx context.Context, path st
 	return c.doRequest(ctx, http.MethodPost, fullURL, pr, reqHeaders)
 }
 
-// --- Response 方法 ---
+// writeMultipartData: 辅助方法，用于写入 multipart 数据
+func (c *HttpClient) writeMultipartData(writer *multipart.Writer, data map[string]string, files map[string]string) error {
+	// 写入文本字段
+	for key, val := range data {
+		if err := writer.WriteField(key, val); err != nil {
+			return fmt.Errorf("failed to write form field '%s': %w", key, err)
+		}
+	}
+
+	// 写入文件字段
+	for key, filePath := range files {
+		file, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to open file '%s': %w", filePath, err)
+		}
+
+		part, err := writer.CreateFormFile(key, filepath.Base(filePath))
+		if err != nil {
+			file.Close() // 立即关闭文件
+			return fmt.Errorf("failed to create form file for '%s': %w", filePath, err)
+		}
+
+		_, copyErr := io.Copy(part, file)
+		closeErr := file.Close() // 立即关闭文件
+
+		if copyErr != nil {
+			return fmt.Errorf("failed to copy file content for '%s': %w", filePath, copyErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("failed to close file '%s': %w", filePath, closeErr)
+		}
+	}
+
+	return nil
+}
+
 
 func (r *Response) String() string {
 	return string(r.Body)
 }
 
 func (r *Response) JSON(v interface{}) error {
-	return json.Unmarshal(r.Body, v)
+	if v == nil {
+		return fmt.Errorf("destination cannot be nil")
+	}
+	if len(r.Body) == 0 {
+		return fmt.Errorf("response body is empty")
+	}
+	if err := json.Unmarshal(r.Body, v); err != nil {
+		return fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+	return nil
 }
 
 func (r *Response) IsSuccess() bool {

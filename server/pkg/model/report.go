@@ -43,7 +43,7 @@ type CrashReport struct {
 	PatchModified     []string    `json:"patch_modified_files"`
 }
 
-func (cr *CrashReport) Scan(value interface{}) error {
+func (cr *CrashReport) Scan(value any) error {
 	bytes, ok := value.([]byte)
 	if !ok {
 		return fmt.Errorf("type assertion to []byte failed, got %T instead", value)

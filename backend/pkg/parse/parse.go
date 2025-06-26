@@ -48,10 +48,11 @@ type CrashReport struct {
 
 // construct directory with CrashReport
 func kernelPath(report *CrashReport) string {
-	return fmt.Sprintf("build/%s/linux-%s", report.Crashes[0].KernelSourceCommit, report.Crashes[0].KernelSourceCommit)
+	rootPath, _ := os.Getwd()
+	return filepath.Join(rootPath, fmt.Sprintf("build/%s/linux-%s", report.Crashes[0].KernelSourceCommit, report.Crashes[0].KernelSourceCommit))
 }
 
-// Parse panic program when parse json error
+// panic program when parse json error
 func Parse(filename string) CrashReport {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -66,13 +67,25 @@ func Parse(filename string) CrashReport {
 	return report
 }
 
-// WritePatch write patch into linux kernel dir, use git apply to apply patch and rebuild kernel
-func WritePatch(report *CrashReport, filename string) {
+// write patch into linux kernel dir, use git apply to apply patch and rebuild kernel
+func WritePatch(report *CrashReport, filename string) error {
 	filePath := filepath.Join(kernelPath(report), filename)
+	log.Infoln("writing patch to", filePath)
 	err := os.WriteFile(filePath, []byte(report.Patch), 0644)
 	if err != nil {
-		log.Errorln(err)
-		return
+		return fmt.Errorf("failed to write patch file %s: %v", filePath, err)
 	}
-	log.Infof("patch written to %s\n", filename)
+	log.Infoln("patch written to", filename)
+	return nil
+}
+
+func WriteCustomPatch(report *CrashReport, filename, patch string) error {
+	filePath := filepath.Join(kernelPath(report), filename)
+	log.Infoln("writing patch to", filePath)
+	err := os.WriteFile(filePath, []byte(patch), 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write patch file %s: %v", filePath, err)
+	}
+	log.Infoln("patch written to", filename)
+	return nil
 }

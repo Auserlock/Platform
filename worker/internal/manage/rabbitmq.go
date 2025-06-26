@@ -160,14 +160,14 @@ func (c *RabbitMQClient) triggerReconnect() {
 }
 
 func (c *RabbitMQClient) Consume() (<-chan Delivery, error) {
-	log.Infoln("Starting persistent consumer...")
+	log.Infoln("starting persistent consumer...")
 
 	go func() {
 		for {
 			c.closeMtx.Lock()
 			if c.isClosed {
 				c.closeMtx.Unlock()
-				log.Infoln("Consumer stopping because client is closed.")
+				log.Infoln("consumer stopping because client is closed.")
 				close(c.deliveryCh)
 				return
 			}
@@ -178,14 +178,14 @@ func (c *RabbitMQClient) Consume() (<-chan Delivery, error) {
 			c.connMtx.Unlock()
 
 			if channel == nil || channel.IsClosed() {
-				log.Warningln("Consumer waiting for channel to be ready...")
+				log.Warningln("consumer waiting for channel to be ready...")
 				time.Sleep(2 * time.Second)
 				continue
 			}
 
 			err := channel.Qos(1, 0, false)
 			if err != nil {
-				log.Errorf("Failed to set QOS, will retry..., error: %v", err)
+				log.Errorf("failed to set QOS, will retry..., error: %v", err)
 				time.Sleep(2 * time.Second)
 				continue
 			}
@@ -205,7 +205,7 @@ func (c *RabbitMQClient) Consume() (<-chan Delivery, error) {
 				continue
 			}
 
-			log.Infoln("Consumer registered and waiting for messages...")
+			log.Infoln("consumer registered and waiting for messages...")
 
 			for msg := range msgs {
 				delivery := Delivery{

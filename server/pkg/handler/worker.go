@@ -5,11 +5,12 @@ import (
 	"Server/pkg/middleware"
 	"Server/pkg/model"
 	"errors"
-	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type RegisterWorkerRequest struct {

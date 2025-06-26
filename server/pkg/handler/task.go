@@ -7,15 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"io"
 	"log"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func CreateTaskHandler(db *gorm.DB, rmqClient *manager.RabbitMQClient) gin.HandlerFunc {
@@ -59,7 +60,7 @@ func CreateTaskHandler(db *gorm.DB, rmqClient *manager.RabbitMQClient) gin.Handl
 		case model.TaskTypePatchApply:
 			slog.Info("handling 'patch-apply' task...")
 
-			existingTaskUUID := c.PostForm("uuid")
+			existingTaskUUID := c.PostForm("id")
 			if existingTaskUUID == "" {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Missing 'uuid' for patch-apply task"})
 				return
@@ -228,7 +229,7 @@ func AcceptTaskHandler(db *gorm.DB) gin.HandlerFunc {
 				return err
 			}
 
-			if task.WorkerID != "" {
+			if task.WorkerID != "" && task.Status == model.StatusSuccess {
 				return fmt.Errorf("task already accepted by worker %s", task.WorkerID)
 			}
 
@@ -263,17 +264,13 @@ func AcceptTaskHandler(db *gorm.DB) gin.HandlerFunc {
 	}
 }
 
-// UpdateTaskStatusHandler 用于更新一个任务的状态.
-// 通常由 Worker 在任务完成后调用.
 func UpdateTaskStatusHandler(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 1. 定义请求体结构
 		type RequestBody struct {
 			Status model.TaskStatus `json:"status" binding:"required"`
 			Result string           `json:"result"`
 		}
 
-		// 2. 从 URL 中获取任务 ID
 		idStr := c.Param("id")
 		taskID, err := uuid.Parse(idStr)
 		if err != nil {
@@ -281,14 +278,12 @@ func UpdateTaskStatusHandler(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// 3. 绑定并验证请求体
 		var reqBody RequestBody
 		if err := c.ShouldBindJSON(&reqBody); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body: " + err.Error()})
 			return
 		}
 
-		// 4. 校验状态是否为有效的终结状态
 		if reqBody.Status != model.StatusSuccess && reqBody.Status != model.StatusFailed {
 			errorMsg := fmt.Sprintf("Invalid status update: '%s'. Status can only be updated to '%s' or '%s'",
 				reqBody.Status, model.StatusSuccess, model.StatusFailed)
@@ -298,41 +293,36 @@ func UpdateTaskStatusHandler(db *gorm.DB) gin.HandlerFunc {
 
 		var updatedTask model.Task
 
-		// 5. 使用事务来更新数据库，确保原子性
 		err = db.Transaction(func(tx *gorm.DB) error {
 			var task model.Task
 
-			// 查找任务
 			if err := tx.First(&task, "id = ?", taskID).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return fmt.Errorf("task not found")
 				}
-				return err // 其他数据库错误
+				return err
 			}
 
-			// 准备要更新的字段
-			updateFields := map[string]interface{}{
+			updateFields := map[string]any{
 				"status":      reqBody.Status,
 				"result":      reqBody.Result,
 				"finished_at": time.Now().UTC(),
 			}
 
-			// 执行更新操作
 			if err := tx.Model(&task).Updates(updateFields).Error; err != nil {
 				return err
 			}
 
 			updatedTask = task
-			// 更新本地 updatedTask 变量以反映更改
+
 			updatedTask.Status = reqBody.Status
 			updatedTask.Result = reqBody.Result
 			now := time.Now().UTC()
 			updatedTask.FinishedAt = &now
 
-			return nil // 提交事务
+			return nil
 		})
 
-		// 6. 处理事务执行结果
 		if err != nil {
 			slog.Error("failed to update task status", "task_id", taskID, "error", err)
 			if err.Error() == "task not found" {

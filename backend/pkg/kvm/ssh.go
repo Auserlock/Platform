@@ -3,6 +3,7 @@ package kvm
 import (
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"time"
 
@@ -57,15 +58,21 @@ func (sm *SSHManager) Connect() error {
 	}
 
 	address := fmt.Sprintf("%s:%d", sm.config.Host, sm.config.Port)
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	maxRetries := 5
 	var client *ssh.Client
-	for i := 1; i <= maxRetries; i++ {
+	for i := range maxRetries {
 		var err error
 		client, err = ssh.Dial("tcp", address, clientConfig)
 		if err != nil {
 			log.Errorf("fail to dial at try %d: %v", i, err)
 		}
-		time.Sleep(5 * time.Second)
+
+		backoff := min(1<<i, 30)
+		jitter := time.Duration(r.Intn(backoff)+1) * time.Second
+		log.Infof("sleep %s before retrying to connect SSH: %v\n", jitter, err)
+		time.Sleep(jitter)
 	}
 
 	sm.client = client
@@ -87,6 +94,7 @@ func (sm *SSHManager) loadPrivateKey(keyPath string) (ssh.Signer, error) {
 	return signer, nil
 }
 
+// return stderr and stdout combined. if persistent, it will not return until the command is finished.
 func (sm *SSHManager) Execute(cmd string) (string, error) {
 	if sm.client == nil {
 		return "", fmt.Errorf("SSH client has not been initialized")
@@ -97,7 +105,7 @@ func (sm *SSHManager) Execute(cmd string) (string, error) {
 		return "", fmt.Errorf("fail to create session: %v", err)
 	}
 	defer func() {
-		if err := session.Close(); err != nil {
+		if err := session.Close(); err != nil && err != io.EOF {
 			log.Errorln(err)
 		}
 	}()
@@ -106,7 +114,8 @@ func (sm *SSHManager) Execute(cmd string) (string, error) {
 	if err != nil {
 		return string(output), fmt.Errorf("fail to execute command: %v", err)
 	}
-	log.Infof("command output: %s", string(output))
+
+	fmt.Printf("command output: %s", string(output))
 	return string(output), nil
 }
 

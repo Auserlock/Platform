@@ -7,7 +7,12 @@ import (
 )
 
 type Config struct {
-	Port string `json:"port"` // proxy port
+	Port string   `json:"port"` // proxy port
+	VM   VMConfig `json:"vm"`
+}
+
+type VMConfig struct {
+	Memory string `json:"memory"` // memory size in MB
 }
 
 var GlobalConfig Config
@@ -25,4 +30,5 @@ func Load(file string) error {
 		return fmt.Errorf("failed to parse config file %s: %v", file, err)
 	}
 
+	return nil
 }

@@ -2,25 +2,22 @@ package rpc
 
 import (
 	pb "Server/pkg/proto"
-	"Server/pkg/websocket" // 1. 【已添加】导入我们创建的 websocket 包
+	"Server/pkg/websocket"
 	"encoding/json"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
-// LogMessageForJSON 定义了要发送给 WebSocket 客户端的JSON结构
-// 我们需要这个结构来确保字段名是小驼峰 (camelCase)，以匹配前端的期望
 type LogMessageForJSON struct {
 	Time    string `json:"time"`
-	Level   string `json:"level"`
 	Message string `json:"message"`
-	TaskID  string `json:"taskId"` // 注意这里的字段名是 "taskId"
+	TaskID  string `json:"taskId"`
 }
 
-// LogStreamServer 结构体
 type LogStreamServer struct {
 	pb.UnimplementedLogStreamServiceServer
 	mu   sync.RWMutex
@@ -37,7 +34,7 @@ func NewLogStreamServer(hub *websocket.Hub) *LogStreamServer {
 }
 
 func (s *LogStreamServer) UploadLogs(stream pb.LogStreamService_UploadLogsServer) error {
-	log.Infoln("Start upload logs")
+	log.Infoln("start upload logs")
 	var count int64
 	var client string
 
@@ -64,12 +61,12 @@ func (s *LogStreamServer) UploadLogs(stream pb.LogStreamService_UploadLogsServer
 
 		log.Infof("Received log from %s [%s]: %s",
 			logMsg.ClientId,
-			logMsg.Level.String(),
+			logMsg.TaskId,
 			logMsg.Message)
 
 		if s.Hub != nil {
 			logForWs := LogMessageForJSON{
-				TaskID:  logMsg.ClientId,
+				TaskID:  logMsg.TaskId,
 				Time:    time.Now().Format(time.RFC3339),
 				Message: logMsg.Message,
 			}

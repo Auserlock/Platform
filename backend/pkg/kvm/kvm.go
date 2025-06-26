@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os/exec"
 	"strings"
@@ -57,7 +58,7 @@ func (qm *QEMUManager) StartVM() error {
 	if err := qm.cmd.Start(); err != nil {
 		return err
 	}
-	time.Sleep(time.Second * 30)
+	time.Sleep(time.Second * 10) // waiting for qemu to start. just a workaround, should be replaced with a better way
 
 	if err := qm.connectMonitor(); err != nil {
 		return fmt.Errorf("fail to connect monitor port: %v", err)
@@ -69,13 +70,21 @@ func (qm *QEMUManager) StartVM() error {
 
 func (qm *QEMUManager) connectMonitor() error {
 	var err error
-	for i := 0; i < 10; i++ {
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for i := range 10 {
 		qm.monitorConn, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", qm.vmConfig.MonitorPort))
 		if err == nil {
 			break
 		}
-		time.Sleep(3 * time.Second)
+
+		backoff := min(1<<i, 30)
+		jitter := time.Duration(r.Intn(backoff)+1) * time.Second
+		log.Infof("sleep %s before retrying to connect monitor port: %v\n", jitter, err)
+		time.Sleep(jitter)
 	}
+
 	if err != nil {
 		return fmt.Errorf("cannot connect monitor port: %v", err)
 	}
@@ -90,7 +99,7 @@ var monitorMutex sync.Mutex
 func drainMonitor(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	io.Copy(io.Discard, conn)
-	conn.SetReadDeadline(time.Time{}) // 清除deadline
+	conn.SetReadDeadline(time.Time{})
 }
 
 // ExecuteMonitorCommand !TODO debug this one to display better output
@@ -102,7 +111,6 @@ func (qm *QEMUManager) ExecuteMonitorCommand(command string) (string, error) {
 	monitorMutex.Lock()
 	defer monitorMutex.Unlock()
 
-	// 先清空旧的残留输出，避免回显叠加
 	drainMonitor(qm.monitorConn)
 
 	_, err := fmt.Fprintf(qm.monitorConn, "%s\n", command)
@@ -123,7 +131,7 @@ func (qm *QEMUManager) ExecuteMonitorCommand(command string) (string, error) {
 			return "", fmt.Errorf("failed reading response: %w", err)
 		}
 
-		fmt.Print(line) // 打印调试用
+		// fmt.Print(line)
 
 		response.WriteString(line)
 
@@ -136,29 +144,8 @@ func (qm *QEMUManager) ExecuteMonitorCommand(command string) (string, error) {
 }
 
 func (qm *QEMUManager) ConnectVM(config SSHConfig) error {
-	var conn net.Conn
-	var err error
-
-	for i := 0; i < 30; i++ {
-		conn, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", qm.vmConfig.MonitorPort), 5*time.Second)
-		if err == nil {
-			err := conn.Close()
-			if err != nil {
-				return err
-			}
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-
-	if err != nil {
-		return fmt.Errorf("ssh systemctl not available: %v", err)
-	}
-
 	sshManager := NewSSHManager(config)
-
-	err = sshManager.Connect()
-
+	err := sshManager.Connect()
 	qm.SSH = sshManager
 
 	return err
