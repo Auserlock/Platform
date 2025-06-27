@@ -147,7 +147,7 @@ func Kexec(sshManager *kvm.SSHManager) error {
 }
 
 func Gcc(sshManager *kvm.SSHManager) error {
-	return SSHExecute("gcc bug.c -o bug -static", sshManager)
+	return SSHExecute("gcc bug.c -o bug", sshManager)
 }
 
 func Bug(sshManager *kvm.SSHManager) error {
@@ -202,7 +202,7 @@ func Generate(f string) error {
 	if err = Bug(ssh); err != nil {
 		log.Errorln(err)
 	}
-	time.Sleep(time.Second * 15)
+	time.Sleep(time.Minute)
 
 	if err = BuildKernel(&data); err != nil {
 		return err
