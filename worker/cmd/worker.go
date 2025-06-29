@@ -34,6 +34,7 @@ const (
 )
 
 var amqpURI string
+var worker config.Worker
 
 // RegisterMsg 注册响应消息
 type RegisterMsg struct {
@@ -71,13 +72,16 @@ type WorkerService struct {
 	isConnected bool
 }
 
+func init() {
+	var err error
+	worker, err = config.LoadWorkerConfig(configFilePath)
+	if err != nil {
+		log.Panic("failed to load worker config: %w", err)
+	}
+}
+
 // NewWorkerService 创建工作节点服务
 func NewWorkerService() (*WorkerService, error) {
-	worker, err := config.LoadWorkerConfig(configFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load worker config: %w", err)
-	}
-
 	amqpURI = fmt.Sprintf("amqp://guest:123456@%s:5672/", config.GlobalWorker.IPAddress)
 
 	config := network.Config{
@@ -305,7 +309,7 @@ func (ws *WorkerService) processDelivery(ctx context.Context, d queue.Delivery) 
 
 	if err := ws.handleMessage(ctx, messageBody); err != nil {
 		log.Warnf("task handling failed: %v, message: %s", err, messageBody)
-		if err := d.Nack(true); err != nil {
+		if err := d.Ack(); err != nil {
 			log.Errorf("failed to nack message: %v", err)
 		}
 	} else {
