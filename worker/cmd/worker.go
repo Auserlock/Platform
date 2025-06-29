@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"worker/internal/config"
 	queue "worker/internal/manage"
 	"worker/internal/network"
 	"worker/internal/parse"
@@ -25,13 +26,14 @@ import (
 
 const (
 	configFilePath       = "config/worker.json"
-	amqpURI              = "amqp://guest:123456@130.33.112.212:5672/"
 	queueName            = "task_queue"
 	pingInterval         = time.Minute
 	acceptTimeout        = 2 * time.Second
 	reconnectDelay       = time.Minute
 	maxReconnectAttempts = 5
 )
+
+var amqpURI string
 
 // RegisterMsg 注册响应消息
 type RegisterMsg struct {
@@ -42,11 +44,7 @@ type RegisterMsg struct {
 }
 
 // Worker 工作节点配置
-type Worker struct {
-	WorkerID string `json:"worker_id"`
-	Hostname string `json:"hostname"`
-	APIKey   string `json:"api_key"`
-}
+type Worker = config.Worker
 
 // Message 任务消息
 type Message struct {
@@ -75,13 +73,15 @@ type WorkerService struct {
 
 // NewWorkerService 创建工作节点服务
 func NewWorkerService() (*WorkerService, error) {
-	worker, err := loadWorkerConfig()
+	worker, err := config.LoadWorkerConfig(configFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load worker config: %w", err)
 	}
 
+	amqpURI = fmt.Sprintf("amqp://guest:123456@%s:5672/", config.GlobalWorker.IPAddress)
+
 	config := network.Config{
-		BaseURL: "http://130.33.112.212:8080",
+		BaseURL: fmt.Sprintf("http://%s:8080", worker.IPAddress),
 		Timeout: 30 * time.Second,
 		Headers: map[string]string{},
 	}
@@ -91,22 +91,6 @@ func NewWorkerService() (*WorkerService, error) {
 		worker: worker,
 		client: client,
 	}, nil
-}
-
-// loadWorkerConfig 加载工作节点配置
-func loadWorkerConfig() (Worker, error) {
-	var worker Worker
-
-	jsonData, err := os.ReadFile(configFilePath)
-	if err != nil {
-		return worker, fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	if err := json.Unmarshal(jsonData, &worker); err != nil {
-		return worker, fmt.Errorf("failed to parse config JSON: %w", err)
-	}
-
-	return worker, nil
 }
 
 // saveWorkerConfig 保存工作节点配置

@@ -1,5 +1,6 @@
 {
   "worker_id": "worker1",
-  "hostname": "arch-130.33.112.212",
-  "api_key": "4a7899b8-23c5-41bd-a145-dc1f437115ff"
+  "hostname": "arch-localhost",
+  "api_key": "483f62aa-a66b-4cb6-aa5e-a0fb3024fd6f",
+  "ip_address": "130.33.112.212"
 }

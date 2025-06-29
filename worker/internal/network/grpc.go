@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"worker/internal/config"
 	pb "worker/internal/proto"
 
 	log "github.com/sirupsen/logrus"
@@ -31,7 +32,7 @@ const (
 
 var (
 	clientID   = flag.String("id", "worker1", "The unique ID for this client")
-	ServerAddr = flag.String("server", "130.33.112.212:50051", "The server address in the format of host:port")
+	ServerAddr = flag.String("server", fmt.Sprintf("%s:50051", config.GlobalWorker.IPAddress), "The server address in the format of host:port")
 	Command    = flag.String("Command", "", "An initial Command to execute and stream its output. If empty, client only polls for commands.")
 )
 

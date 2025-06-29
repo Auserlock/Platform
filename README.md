@@ -8,6 +8,7 @@
 - npm
 - tar
 - make
+- docker
 - gdb
 - bear
 
@@ -46,60 +47,52 @@ sudo apt-get install gdb tar make gcc clang
 └── work # qemu启动的工作目录
 ```
 
-
 ## 3. 环境变量配置
 
-### 3.1 AI相关配置
-修改`kdump-agent/new_agent_core/.env`文件：
-```bash
-DEEPSEEK_API_KEY = "your-deepseek-api-key"
-TAVILY_API_KEY = "your-tavily-api-key"
+### 3.1 路径配置
+修改`backend/pkg/compile/kernel.go`中的以下路径变量：
+```golang
+var toolChains = map[string]string{
+	"gcc-10.2.0": "toolchain/gcc/gcc-10.2.0",
+	"gcc-10.1.0": "toolchain/gcc/gcc-10.1.0",
+	"gcc-15.1.0": "toolchain/gcc/gcc-15.1.0",
+	"gcc-9.1.0":  "toolchain/gcc/gcc-9.1.0",
+}
 ```
 
-### 3.2 路径配置
-修改`kdump-agent/new_agent_core/KdumpAgent.py`中的以下路径变量：
-```python
-# 这些路径在完成Env脚本安装后可以确定
-KERNEL_PATH = "/path/to/kernel/source"  # 内核源代码路径（通常位于Env/kernel_sources/）
-VMLINUX_PATH = "/path/to/vmlinux"      # 内核vmlinux文件路径（编译后生成）
-VMCORE_PATH = "/path/to/vmcore"        # vmcore文件路径（通常位于Env/vmcore_gen/）
-KDUMP_GDBSERVER_PATH = "/path/to/kdump-gdbserver"  # 由build.sh安装到Env/extracted/
-```
+### 3.2 config配置说明
+
+- `worker/config/worker.json` 用于配置worker相关信息，可以修改ip address（如果是本地部署）
+- `build-vmcore/config.json` 用于配置编译内核的信息，目前仅可以配置代理端口与虚拟机所需的memory大小
 
 ## 4. 使用说明
 
-1. 激活conda环境：
+1. 编译服务器，worker与backend：
 ```bash
-conda activate kdump
+cd backend
+go build -o kernel-builder cmd/main.go
+mv kernel-builder ../build-vmcore
+cd ../server
+docker-compose up -d
+go build -o server cmd/server.go
+cd ../worker
+go build cmd/worker.go
+cd ../frontend
+pnpm run dev # 用于测试
 ```
 
-2. 运行分析工具：
+由于已经部署了网页前端，故运行worker即可
+
+2. 运行工具：
 ```bash
-python kdump-agent/new_agent_core/KdumpAgent.py
+./worker
 ```
+
+3. 访问网页前端
+> http://130.33.112.212 
 
 ## 5. 注意事项
 
-1. 确保内核源代码版本与vmcore文件匹配
-2. 编译环境需要至少4GB内存
-3. 首次运行可能需要较长时间初始化
-4. 如需使用虚拟环境，可在运行build.sh时指定：
-```bash
-./build.sh --install --venv /path/to/venv
-```
-
-## 6. 常见问题
-
-### 6.1 缺少libkdumpfile
-```bash
-sudo ldconfig
-```
-
-### 6.2 GDB Python支持问题
-重新安装带有Python支持的GDB：
-```bash
-sudo apt-get install gdb python3-dbg
-```
-
-### 6.3 权限问题
-确保对vmcore文件有读取权限
+1. 注意修改build-vmcore中的config,用于配置请求syzbot.com的资源
+2. 编译内核时间较长，需等待
+3. 需要手动编译gcc或clang放置在vmcore的toolchain下并修改源代码
