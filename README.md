@@ -21,7 +21,31 @@ sudo apt-get install gdb tar make gcc clang
 
 ## 2. 依赖安装
 
-编译
+整个项目的目录如下：
+```
+├── backend
+├── build-crash-image # 构建kdump的bzImage与initcpio
+├── build-vmcore # 构建vmcore的工作目录
+├── frontend # web UI
+├── README.md
+├── server
+└── worker # worker
+```
+
+其中build-vmcore目录如下：
+
+```
+├── build # 编译内核工作文件夹
+├── config.json # 可执行程序的配置文件
+├── image # 存放启动镜像
+├── kernel-benchmark
+├── kernel-builder 可执行程序
+├── log # qemu后台运行日志，（必需）
+├── script # shell-scripts 用于辅助启动qemu等
+├── toolchain # 存放gcc等工具链，需要在go的backend中手动配置
+└── work # qemu启动的工作目录
+```
+
 
 ## 3. 环境变量配置
 
